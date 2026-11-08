@@ -71,6 +71,16 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
+	// mgu (BMW head unit, 05/11/2026): cap what one TCP connection may queue toward the peer. gVisor's 1 MB default
+	// is ~8 s of queue on a 1 Mbit/s mobile uplink: an upload stuffs the phone's buffer, then every other flow, the
+	// ACKs of a video stream and the handshake responses wait behind it (measured: 9.8 s freeze after an upload).
+	// WG_TCP_SNDBUF (bytes) overrides; 0 keeps gVisor's default.
+	if sb := tcpSendBuf(); sb > 0 {
+		sendOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: sb, Max: sb}
+		if tcpipErr = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt); tcpipErr != nil {
+			return nil, nil, fmt.Errorf("could not set the TCP send buffer: %v", tcpipErr)
+		}
+	}
 	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
 	if tcpipErr != nil {
@@ -1054,4 +1064,17 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 
 func (tnet *Net) Dial(network, address string) (net.Conn, error) {
 	return tnet.DialContext(context.Background(), network, address)
+}
+
+// tcpSendBuf: the per-connection TCP send buffer cap in bytes (WG_TCP_SNDBUF; default 128 KiB, 0 = gVisor default).
+func tcpSendBuf() int {
+	if v, ok := os.LookupEnv("WG_TCP_SNDBUF"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			if n > 0 && n < 4096 {
+				n = 4096
+			}
+			return n
+		}
+	}
+	return 128 << 10
 }
